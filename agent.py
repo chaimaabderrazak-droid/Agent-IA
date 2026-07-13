@@ -17,6 +17,8 @@ Lancer avec : python agent.py
 
 import json
 
+from groq import APIError, APIConnectionError, BadRequestError, RateLimitError
+
 from llm_client import client, MODELE
 from prompts import SYSTEM_PROMPT
 from tools_schema import TOOLS, OUTILS_A_CONFIRMER
@@ -49,16 +51,58 @@ def executer_outil(nom_outil: str, arguments: dict) -> dict:
     return fonction(**arguments)
 
 
+def appeler_llm(messages: list):
+    """Appelle Groq et intercepte les erreurs possibles au lieu de laisser
+    planter le programme. Retourne le message du LLM, ou None en cas d'échec
+    (auquel cas un message d'erreur adapté a déjà été affiché à l'utilisateur)."""
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELE,
+            messages=messages,
+            tools=TOOLS,
+        )
+        return response.choices[0].message
+
+    except BadRequestError as e:
+        # Cas typique : "tool_use_failed" -> le modèle a généré un appel
+        # d'outil mal formé (JSON tronqué/invalide). Ce n'est pas une erreur
+        # de notre code, mais un raté ponctuel de génération du LLM.
+        print(
+            "\n⚠️  L'agent n'a pas réussi à formuler correctement son action "
+            "(erreur interne du modèle). Peux-tu reformuler ta demande "
+            "de façon plus précise ?"
+        )
+        return None
+
+    except RateLimitError:
+        print(
+            "\n⚠️  Limite de requêtes Groq atteinte pour le moment. "
+            "Réessaie dans quelques instants."
+        )
+        return None
+
+    except APIConnectionError:
+        print(
+            "\n⚠️  Impossible de contacter l'API Groq (problème réseau). "
+            "Vérifie ta connexion internet et réessaie."
+        )
+        return None
+
+    except APIError as e:
+        print(f"\n⚠️  Erreur inattendue de l'API Groq : {e}")
+        return None
+
+
 def traiter_message(messages: list) -> list:
     """Envoie les messages au LLM, gère l'appel d'outil éventuel,
     et retourne l'historique de messages mis à jour."""
 
-    response = client.chat.completions.create(
-        model=MODELE,
-        messages=messages,
-        tools=TOOLS,
-    )
-    message_llm = response.choices[0].message
+    message_llm = appeler_llm(messages)
+    if message_llm is None:
+        # Échec du premier appel : on ne touche pas à l'historique, on laisse
+        # l'utilisateur reformuler son dernier message au tour suivant.
+        return messages
 
     # On ajoute la réponse du LLM à l'historique (format attendu par l'API :
     # un dict, pas l'objet Python directement)
@@ -67,7 +111,20 @@ def traiter_message(messages: list) -> list:
     if message_llm.tool_calls:
         for tool_call in message_llm.tool_calls:
             nom_outil = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
+
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                resultat = {
+                    "status": "erreur",
+                    "message": "Arguments d'outil invalides (JSON malformé).",
+                }
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(resultat, ensure_ascii=False),
+                })
+                continue
 
             if nom_outil in OUTILS_A_CONFIRMER:
                 if not demander_confirmation(nom_outil, arguments):
@@ -87,12 +144,17 @@ def traiter_message(messages: list) -> list:
             })
 
         # Deuxième appel : le LLM formule sa réponse finale à partir du résultat
-        response_finale = client.chat.completions.create(
-            model=MODELE,
-            messages=messages,
-            tools=TOOLS,
-        )
-        message_final = response_finale.choices[0].message
+        message_final = appeler_llm(messages)
+        if message_final is None:
+            # L'outil a bien été exécuté (le résultat est dans l'historique),
+            # seule la formulation finale du LLM a échoué. On informe
+            # l'utilisateur sans perdre le travail déjà fait.
+            print(
+                "\nAgent : L'action a été traitée, mais je n'ai pas réussi à "
+                "formuler ma réponse. Tu peux me redemander un résumé."
+            )
+            return messages
+
         messages.append(message_final.model_dump(exclude_none=True))
         print(f"\nAgent : {message_final.content}")
     else:
